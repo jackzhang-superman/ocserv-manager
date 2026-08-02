@@ -79,7 +79,7 @@ load_config() {
     : "${AUDIT_RETENTION_DAYS:=31}"
     : "${SESSION_AUDIT_ENABLED:=yes}"
     : "${SESSION_SCAN_INTERVAL:=30}"
-    : "${OCCTL_COMMAND:=occtl -j show users}"
+    : "${OCCTL_COMMAND:=docker exec ocserv occtl -j show users}"
     : "${IPTABLES_BIN:=/usr/sbin/iptables}"
 }
 
