@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 PROGRAM="ocserv-manager"
-VERSION="2.0.1"
+VERSION="2.1.0"
 
 INSTALL_PATH="/usr/local/sbin/ocserv-manager"
 CONFIG_DIR="/etc/ocserv-manager"
@@ -10,6 +10,8 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 PORT_MAP_FILE="${CONFIG_DIR}/port-mappings.tsv"
 STATE_DIR="/var/lib/ocserv-manager"
 SESSION_STATE="${STATE_DIR}/active-sessions.tsv"
+AUDIT_DB="${STATE_DIR}/audit.db"
+LIMIT_LOCK_FILE="/run/lock/ocserv-manager-limit.lock"
 LOG_DIR="/var/log/ocserv-manager"
 AUDIT_DIR="${LOG_DIR}/audit"
 SESSION_DIR="${LOG_DIR}/sessions"
@@ -21,6 +23,8 @@ NETWORK_TIMER="/etc/systemd/system/ocserv-network.timer"
 LIMIT_SERVICE="/etc/systemd/system/ocserv-limit.service"
 AUDIT_SERVICE="/etc/systemd/system/ocserv-audit.service"
 SESSION_SERVICE="/etc/systemd/system/ocserv-session-audit.service"
+AUDIT_MAINT_SERVICE="/etc/systemd/system/ocserv-audit-maintenance.service"
+AUDIT_MAINT_TIMER="/etc/systemd/system/ocserv-audit-maintenance.timer"
 
 FORWARD_CHAIN="OCSERV_FORWARD"
 BT_CHAIN="OCSERV_BT_GUARD"
@@ -77,6 +81,9 @@ load_config() {
     : "${BT_STRING_MATCH:=yes}"
     : "${AUDIT_ENABLED:=yes}"
     : "${AUDIT_RETENTION_DAYS:=31}"
+    : "${AUDIT_IGNORE_NONPUBLIC_DESTINATIONS:=yes}"
+    : "${AUDIT_IGNORE_DNS:=yes}"
+    : "${AUDIT_DNS_SERVERS:=8.8.8.8,8.8.4.4}"
     : "${SESSION_AUDIT_ENABLED:=yes}"
     : "${SESSION_SCAN_INTERVAL:=30}"
     : "${OCCTL_COMMAND:=docker exec ocserv occtl -j show users}"
@@ -266,7 +273,6 @@ ensure_ifb() {
 run_tc() {
     local description="$1"
     shift
-
     if ! "$@"; then
         logger -t "$PROGRAM" "tc failed: $description; command=$*"
         warn "tc 操作失败：$description"
@@ -276,14 +282,9 @@ run_tc() {
 
 configure_ifb() {
     ensure_ifb
-
-    # Rebuild the IFB root hierarchy from scratch. Using replace/change can
-    # fail when an older script left another qdisc type attached to ifb0.
     tc qdisc del dev "$IFB_DEVICE" root 2>/dev/null || true
-
     run_tc "create IFB HTB root on $IFB_DEVICE" \
         tc qdisc add dev "$IFB_DEVICE" root handle 1: htb default 10
-
     run_tc "create IFB HTB class on $IFB_DEVICE" \
         tc class add dev "$IFB_DEVICE" parent 1: classid 1:10 \
         htb rate "$RATE" ceil "$RATE"
@@ -293,24 +294,50 @@ limit_interface() {
     local iface="$1"
     ip link show "$iface" >/dev/null 2>&1 || return 0
 
-    # Remove qdiscs previously created by this or older limiter scripts.
-    # Recreating the hierarchy is more portable than tc replace/change.
+    mkdir -p "$(dirname "$LIMIT_LOCK_FILE")"
+    exec 9>"$LIMIT_LOCK_FILE"
+    flock -x 9
+
+    ip link show "$iface" >/dev/null 2>&1 || {
+        flock -u 9
+        return 0
+    }
+
     tc qdisc del dev "$iface" root 2>/dev/null || true
     tc qdisc del dev "$iface" ingress 2>/dev/null || true
 
-    run_tc "create HTB root on $iface" \
-        tc qdisc add dev "$iface" root handle 1: htb default 10
+    if ! tc qdisc add dev "$iface" root handle 1: htb default 10 2>/tmp/ocserv-tc-error.$$; then
+        if ! tc qdisc show dev "$iface" 2>/dev/null | grep -qE 'qdisc htb 1: root'; then
+            logger -t "$PROGRAM" "tc failed: create HTB root on $iface; $(cat /tmp/ocserv-tc-error.$$ 2>/dev/null)"
+            rm -f /tmp/ocserv-tc-error.$$
+            flock -u 9
+            return 1
+        fi
+    fi
+    rm -f /tmp/ocserv-tc-error.$$
 
     run_tc "create HTB class on $iface" \
-        tc class add dev "$iface" parent 1: classid 1:10 \
-        htb rate "$RATE" ceil "$RATE"
+        tc class replace dev "$iface" parent 1: classid 1:10 \
+        htb rate "$RATE" ceil "$RATE" || {
+            flock -u 9
+            return 1
+        }
 
+    tc qdisc del dev "$iface" ingress 2>/dev/null || true
     run_tc "create ingress qdisc on $iface" \
-        tc qdisc add dev "$iface" handle ffff: ingress
+        tc qdisc add dev "$iface" handle ffff: ingress || {
+            flock -u 9
+            return 1
+        }
 
     run_tc "redirect ingress from $iface to $IFB_DEVICE" \
         tc filter add dev "$iface" parent ffff: protocol all pref 10 u32 \
-        match u32 0 0 action mirred egress redirect dev "$IFB_DEVICE"
+        match u32 0 0 action mirred egress redirect dev "$IFB_DEVICE" || {
+            flock -u 9
+            return 1
+        }
+
+    flock -u 9
 }
 
 limit_apply() {
@@ -357,8 +384,296 @@ limit_clear() {
     log "已清除 tc 限速规则。"
 }
 
-audit_file_today() {
-    printf '%s/nat-%s.csv\n' "$AUDIT_DIR" "$(date -u +%F)"
+audit_db_init() {
+    ensure_dirs
+    sqlite3 "$AUDIT_DB" <<'SQL'
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
+
+CREATE TABLE IF NOT EXISTS nat_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_epoch INTEGER NOT NULL,
+    end_epoch INTEGER,
+    protocol TEXT NOT NULL CHECK(protocol IN ('tcp','udp')),
+    vpn_ip TEXT NOT NULL,
+    vpn_port INTEGER NOT NULL,
+    public_ip TEXT NOT NULL,
+    public_port INTEGER NOT NULL,
+    destination_ip TEXT NOT NULL,
+    destination_port INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_nat_public_lookup
+ON nat_sessions(protocol, public_port, start_epoch, end_epoch);
+
+CREATE INDEX IF NOT EXISTS idx_nat_destination_lookup
+ON nat_sessions(destination_ip, destination_port, protocol, public_port);
+
+CREATE INDEX IF NOT EXISTS idx_nat_vpn_lookup
+ON nat_sessions(vpn_ip, start_epoch, end_epoch);
+SQL
+    chmod 600 "$AUDIT_DB" 2>/dev/null || true
+}
+
+audit_destination_allowed() {
+    local dst_ip="$1" dst_port="$2" proto="$3"
+
+    if [[ "$AUDIT_IGNORE_DNS" == "yes" ]] &&
+       [[ "$dst_port" == "53" || "$dst_port" == "853" ]]; then
+        local dns
+        IFS=',' read -ra _dns_servers <<<"$AUDIT_DNS_SERVERS"
+        for dns in "${_dns_servers[@]}"; do
+            [[ "$dst_ip" == "$dns" ]] && return 1
+        done
+    fi
+
+    [[ "$AUDIT_IGNORE_NONPUBLIC_DESTINATIONS" == "yes" ]] || return 0
+
+    python3 - "$dst_ip" <<'PY'
+import ipaddress
+import sys
+
+ip = ipaddress.ip_address(sys.argv[1])
+blocked = (
+    ip.is_private
+    or ip.is_loopback
+    or ip.is_link_local
+    or ip.is_multicast
+    or ip.is_unspecified
+    or ip.is_reserved
+)
+raise SystemExit(1 if blocked else 0)
+PY
+}
+
+parse_conntrack_line() {
+    local line="$1"
+    local proto event
+    event="$(grep -oE '\[(NEW|DESTROY|UPDATE)\]' <<<"$line" | head -n1 | tr -d '[]' || true)"
+    proto="$(awk '{for(i=1;i<=NF;i++)if($i=="tcp"||$i=="udp"){print $i;exit}}' <<<"$line")"
+    [[ -n "$event" && -n "$proto" ]] || return 1
+
+    mapfile -t srcs < <(grep -oE 'src=[^ ]+' <<<"$line" | cut -d= -f2)
+    mapfile -t dsts < <(grep -oE 'dst=[^ ]+' <<<"$line" | cut -d= -f2)
+    mapfile -t sports < <(grep -oE 'sport=[0-9]+' <<<"$line" | cut -d= -f2)
+    mapfile -t dports < <(grep -oE 'dport=[0-9]+' <<<"$line" | cut -d= -f2)
+
+    ((${#srcs[@]} >= 2 && ${#dsts[@]} >= 2 &&
+       ${#sports[@]} >= 2 && ${#dports[@]} >= 2)) || return 1
+
+    local vpn_ip="${srcs[0]}" vpn_port="${sports[0]}"
+    local dst_ip="${dsts[0]}" dst_port="${dports[0]}"
+    local public_ip="${dsts[1]}" public_port="${dports[1]}"
+
+    python3 - "$vpn_ip" "$VPN_SUBNET" <<'PY' >/dev/null 2>&1 || return 1
+import ipaddress
+import sys
+raise SystemExit(
+    0 if ipaddress.ip_address(sys.argv[1])
+    in ipaddress.ip_network(sys.argv[2], strict=False)
+    else 1
+)
+PY
+
+    [[ "$public_ip" != "$vpn_ip" ]] || return 1
+    audit_destination_allowed "$dst_ip" "$dst_port" "$proto" || return 1
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(date -u +%s)" "$event" "$proto" "$vpn_ip" "$vpn_port" \
+        "$public_ip" "$public_port" "$dst_ip" "$dst_port"
+}
+
+audit_store_record() {
+    local record="$1"
+    local epoch event proto vpn_ip vpn_port public_ip public_port dst_ip dst_port
+    IFS=, read -r epoch event proto vpn_ip vpn_port public_ip public_port dst_ip dst_port <<<"$record"
+
+    if [[ "$event" == "NEW" ]]; then
+        sqlite3 "$AUDIT_DB" <<SQL
+PRAGMA busy_timeout=5000;
+INSERT INTO nat_sessions(
+    start_epoch, protocol, vpn_ip, vpn_port,
+    public_ip, public_port, destination_ip, destination_port
+) VALUES (
+    $epoch, '$proto', '$vpn_ip', $vpn_port,
+    '$public_ip', $public_port, '$dst_ip', $dst_port
+);
+SQL
+    elif [[ "$event" == "DESTROY" ]]; then
+        sqlite3 "$AUDIT_DB" <<SQL
+PRAGMA busy_timeout=5000;
+UPDATE nat_sessions
+SET end_epoch=$epoch
+WHERE id=(
+    SELECT id FROM nat_sessions
+    WHERE end_epoch IS NULL
+      AND protocol='$proto'
+      AND vpn_ip='$vpn_ip'
+      AND vpn_port=$vpn_port
+      AND public_ip='$public_ip'
+      AND public_port=$public_port
+      AND destination_ip='$dst_ip'
+      AND destination_port=$dst_port
+    ORDER BY start_epoch DESC
+    LIMIT 1
+);
+SQL
+    fi
+}
+
+audit_snapshot_current() {
+    conntrack -L -o extended 2>/dev/null |
+    while IFS= read -r line; do
+        local record
+        record="$(parse_conntrack_line "[NEW] $line" || true)"
+        [[ -n "$record" ]] && audit_store_record "$record"
+    done
+}
+
+audit_close_open() {
+    require_root
+    load_config
+    audit_db_init
+    sqlite3 "$AUDIT_DB" \
+        "UPDATE nat_sessions SET end_epoch=strftime('%s','now') WHERE end_epoch IS NULL;"
+}
+
+audit_daemon() {
+    require_root
+    load_config
+    ensure_dirs
+    [[ "$AUDIT_ENABLED" == "yes" ]] || { log "审计未启用。"; sleep infinity; }
+    has conntrack || die "缺少 conntrack。"
+    has sqlite3 || die "缺少 sqlite3。"
+
+    audit_db_init
+
+    # Close uncertain records left by an earlier daemon instance, then take a
+    # fresh snapshot of currently active conntrack entries.
+    sqlite3 "$AUDIT_DB" \
+        "UPDATE nat_sessions SET end_epoch=strftime('%s','now') WHERE end_epoch IS NULL;"
+    audit_snapshot_current
+
+    while true; do
+        stdbuf -oL conntrack -E -e NEW,DESTROY 2>/dev/null |
+        while IFS= read -r line; do
+            local record
+            record="$(parse_conntrack_line "$line" || true)"
+            [[ -n "$record" ]] && audit_store_record "$record"
+        done
+        warn "conntrack 事件流已结束，5 秒后重启。"
+        sleep 5
+    done
+}
+
+audit_maintenance() {
+    require_root
+    load_config
+    audit_db_init
+
+    local cutoff
+    cutoff="$(date -u -d "-${AUDIT_RETENTION_DAYS} days" +%s)"
+
+    sqlite3 "$AUDIT_DB" <<SQL
+PRAGMA busy_timeout=5000;
+DELETE FROM nat_sessions
+WHERE COALESCE(end_epoch,start_epoch) < $cutoff;
+PRAGMA wal_checkpoint(TRUNCATE);
+PRAGMA optimize;
+SQL
+    log "审计数据库维护完成，已清理 ${AUDIT_RETENTION_DAYS} 天前记录。"
+}
+
+audit_migrate_csv() {
+    require_root
+    load_config
+    audit_db_init
+
+    python3 - "$AUDIT_DIR" "$AUDIT_DB" <<'PY'
+import csv
+import gzip
+import pathlib
+import sqlite3
+import sys
+
+audit_dir = pathlib.Path(sys.argv[1])
+db_path = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")
+
+files = sorted(list(audit_dir.glob("nat-*.csv")) + list(audit_dir.glob("nat-*.csv.gz")))
+inserted = closed = 0
+
+for path in files:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", errors="replace", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            try:
+                values = (
+                    int(row["epoch"]), row["protocol"], row["vpn_ip"],
+                    int(row["vpn_port"]), row["public_ip"],
+                    int(row["public_port"]), row["destination_ip"],
+                    int(row["destination_port"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if row.get("event") == "NEW":
+                conn.execute(
+                    """
+                    INSERT INTO nat_sessions(
+                        start_epoch,protocol,vpn_ip,vpn_port,
+                        public_ip,public_port,destination_ip,destination_port
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    values,
+                )
+                inserted += 1
+            elif row.get("event") == "DESTROY":
+                cur = conn.execute(
+                    """
+                    SELECT id FROM nat_sessions
+                    WHERE end_epoch IS NULL
+                      AND protocol=? AND vpn_ip=? AND vpn_port=?
+                      AND public_ip=? AND public_port=?
+                      AND destination_ip=? AND destination_port=?
+                    ORDER BY start_epoch DESC LIMIT 1
+                    """,
+                    (
+                        row["protocol"], row["vpn_ip"], int(row["vpn_port"]),
+                        row["public_ip"], int(row["public_port"]),
+                        row["destination_ip"], int(row["destination_port"]),
+                    ),
+                ).fetchone()
+                if cur:
+                    conn.execute(
+                        "UPDATE nat_sessions SET end_epoch=? WHERE id=?",
+                        (int(row["epoch"]), cur[0]),
+                    )
+                    closed += 1
+
+conn.commit()
+conn.close()
+print(f"CSV migration complete: inserted={inserted}, closed={closed}, files={len(files)}")
+PY
+}
+
+audit_stats() {
+    require_root
+    load_config
+    audit_db_init
+    sqlite3 -header -column "$AUDIT_DB" <<'SQL'
+SELECT
+    COUNT(*) AS total_sessions,
+    SUM(end_epoch IS NULL) AS open_sessions,
+    datetime(MIN(start_epoch),'unixepoch') AS oldest_utc,
+    datetime(MAX(start_epoch),'unixepoch') AS newest_utc
+FROM nat_sessions;
+SQL
+    du -h "$AUDIT_DB" "$AUDIT_DB-wal" 2>/dev/null || true
 }
 
 session_file_today() {
@@ -550,7 +865,7 @@ lookup_username() {
 audit_lookup() {
     require_root
     load_config
-    ensure_dirs
+    audit_db_init
 
     local time_text="" public_port="" protocol="" dst_ip="" dst_port="" tolerance=120
 
@@ -571,49 +886,73 @@ audit_lookup() {
 
     local target_epoch
     target_epoch="$(date -d "$time_text" +%s 2>/dev/null)" ||
-        die "无法解析时间：$time_text。建议包含时区，例如 '2026-08-02 10:30:00 +0800'"
+        die "无法解析时间：$time_text"
 
     protocol="${protocol,,}"
     [[ "$protocol" =~ ^(tcp|udp)$ ]] || die "协议只能是 tcp 或 udp"
+    [[ "$public_port" =~ ^[0-9]+$ ]] || die "公网端口必须是数字"
 
-    local candidates
-    candidates="$(
-        read_log_files "$AUDIT_DIR" 'nat-*.csv' |
-        awk -F, -v t="$target_epoch" -v tol="$tolerance" \
-            -v pp="$public_port" -v proto="$protocol" \
-            -v dip="$dst_ip" -v dp="$dst_port" '
-            $1 ~ /^[0-9]+$/ && $2=="NEW" && $3==proto && $7==pp &&
-            ($1>=t-tol && $1<=t+tol) &&
-            (dip=="" || $8==dip) &&
-            (dp=="" || $9==dp) {
-                diff=$1-t; if(diff<0)diff=-diff
-                print diff "," $0
-            }
-        ' | sort -t, -k1,1n | head -n10
+    local destination_sql=""
+    [[ -n "$dst_ip" ]] && destination_sql+=" AND destination_ip='$dst_ip'"
+    [[ -n "$dst_port" ]] && destination_sql+=" AND destination_port=$dst_port"
+
+    local rows
+    rows="$(
+        sqlite3 -csv "$AUDIT_DB" <<SQL
+SELECT
+    CASE
+      WHEN $target_epoch < start_epoch THEN start_epoch-$target_epoch
+      WHEN end_epoch IS NOT NULL AND $target_epoch > end_epoch THEN $target_epoch-end_epoch
+      ELSE 0
+    END AS diff,
+    start_epoch,
+    end_epoch,
+    protocol,
+    vpn_ip,
+    vpn_port,
+    public_ip,
+    public_port,
+    destination_ip,
+    destination_port
+FROM nat_sessions
+WHERE protocol='$protocol'
+  AND public_port=$public_port
+  AND start_epoch <= $((target_epoch+tolerance))
+  AND COALESCE(end_epoch,start_epoch) >= $((target_epoch-tolerance))
+  $destination_sql
+ORDER BY diff ASC, start_epoch DESC
+LIMIT 10;
+SQL
     )"
 
-    [[ -n "$candidates" ]] || {
-        echo "未找到匹配记录。可尝试增大 --tolerance，或补充/移除目标 IP 与端口条件。"
+    [[ -n "$rows" ]] || {
+        echo "未找到匹配记录。可增大 --tolerance，或补充目标 IP/端口。"
         return 1
     }
 
     echo "========== NAT 历史审计查询 =========="
-    local line diff epoch event proto vpn_ip vpn_port pub_ip pub_port dip dport session username start end
-    while IFS=, read -r diff epoch event proto vpn_ip vpn_port pub_ip pub_port dip dport; do
-        session="$(lookup_username "$epoch" "$vpn_ip")"
+    local diff start end proto vpn_ip vpn_port pub_ip pub_port dip dport session username s e
+    while IFS=, read -r diff start end proto vpn_ip vpn_port pub_ip pub_port dip dport; do
+        session="$(lookup_username "$start" "$vpn_ip")"
         username=""
         if [[ -n "$session" ]]; then
-            IFS=, read -r username start end <<<"$session"
+            IFS=, read -r username s e <<<"$session"
         fi
 
         echo
-        printf '记录时间：%s UTC（相差 %s 秒）\n' "$(date -u -d "@$epoch" '+%F %T')" "$diff"
+        printf '连接开始：%s UTC\n' "$(date -u -d "@$start" '+%F %T')"
+        if [[ -n "$end" ]]; then
+            printf '连接结束：%s UTC\n' "$(date -u -d "@$end" '+%F %T')"
+        else
+            printf '连接结束：当前仍未记录结束\n'
+        fi
+        printf '与查询时间差：%s 秒\n' "$diff"
         printf '协议：%s\n' "$proto"
         printf '公网映射：%s:%s\n' "$pub_ip" "$pub_port"
         printf 'VPN 客户端：%s:%s\n' "$vpn_ip" "$vpn_port"
         printf '远程目标：%s:%s\n' "$dip" "$dport"
         printf 'VPN 用户：%s\n' "${username:-未匹配到用户名会话}"
-    done <<<"$candidates"
+    done <<<"$rows"
 }
 
 port_add() {
@@ -688,7 +1027,7 @@ EOF
     echo
     systemctl --no-pager --full status \
         ocserv-network.timer ocserv-limit.service \
-        ocserv-audit.service ocserv-session-audit.service 2>/dev/null || true
+        ocserv-audit.service ocserv-session-audit.service ocserv-audit-maintenance.timer 2>/dev/null || true
     echo
     "$IPTABLES_BIN" -nvL "$BT_CHAIN" 2>/dev/null || true
 }
@@ -718,10 +1057,13 @@ BT_STRING_MATCH="${BT_STRING_MATCH:-yes}"
 
 AUDIT_ENABLED="${AUDIT_ENABLED:-yes}"
 AUDIT_RETENTION_DAYS="${AUDIT_RETENTION_DAYS:-31}"
+AUDIT_IGNORE_NONPUBLIC_DESTINATIONS="${AUDIT_IGNORE_NONPUBLIC_DESTINATIONS:-yes}"
+AUDIT_IGNORE_DNS="${AUDIT_IGNORE_DNS:-yes}"
+AUDIT_DNS_SERVERS="${AUDIT_DNS_SERVERS:-8.8.8.8,8.8.4.4}"
 
 SESSION_AUDIT_ENABLED="${SESSION_AUDIT_ENABLED:-yes}"
 SESSION_SCAN_INTERVAL="${SESSION_SCAN_INTERVAL:-30}"
-OCCTL_COMMAND="${OCCTL_COMMAND:-occtl -j show users}"
+OCCTL_COMMAND="${OCCTL_COMMAND:-docker exec ocserv occtl -j show users}"
 
 IPTABLES_BIN="${ipt}"
 EOF
@@ -807,12 +1149,37 @@ Nice=10
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    cat > "$AUDIT_MAINT_SERVICE" <<EOF
+[Unit]
+Description=Maintain ocserv audit SQLite database
+
+[Service]
+Type=oneshot
+ExecStart=${INSTALL_PATH} audit-maintenance
+Nice=15
+EOF
+
+    cat > "$AUDIT_MAINT_TIMER" <<'EOF'
+[Unit]
+Description=Daily ocserv audit database maintenance
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+Unit=ocserv-audit-maintenance.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 }
 
 write_logrotate() {
     load_config
     cat > "$LOGROTATE_FILE" <<EOF
-${AUDIT_DIR}/*.csv ${SESSION_DIR}/*.csv {
+${SESSION_DIR}/*.csv ${AUDIT_DIR}/*.csv {
     daily
     rotate ${AUDIT_RETENTION_DAYS}
     compress
@@ -828,11 +1195,11 @@ EOF
 install_program() {
     require_root
 
-    local required=(ip awk sed grep sysctl systemctl tc modprobe python3 conntrack jq gzip find sort stdbuf)
+    local required=(ip awk sed grep sysctl systemctl tc modprobe python3 conntrack jq gzip find sort stdbuf flock sqlite3)
     local missing=() cmd
     for cmd in "${required[@]}"; do has "$cmd" || missing+=("$cmd"); done
     if ((${#missing[@]})); then
-        die "缺少依赖：${missing[*]}。Debian/Ubuntu 可执行：apt install -y iproute2 iptables kmod conntrack jq coreutils python3 logrotate"
+        die "缺少依赖：${missing[*]}。Debian/Ubuntu 可执行：apt install -y iproute2 iptables kmod conntrack jq coreutils python3 logrotate sqlite3"
     fi
 
     ensure_dirs
@@ -852,6 +1219,7 @@ EOF
     systemctl enable --now ocserv-limit.service
     systemctl enable --now ocserv-audit.service
     systemctl enable --now ocserv-session-audit.service
+    systemctl enable --now ocserv-audit-maintenance.timer
     systemctl restart ocserv-network.service
 
     log "安装完成。"
@@ -874,7 +1242,7 @@ uninstall_program() {
     load_config || true
 
     systemctl disable --now ocserv-network.timer ocserv-limit.service \
-        ocserv-audit.service ocserv-session-audit.service 2>/dev/null || true
+        ocserv-audit.service ocserv-session-audit.service ocserv-audit-maintenance.timer 2>/dev/null || true
     systemctl stop ocserv-network.service 2>/dev/null || true
     limit_clear 2>/dev/null || true
 
@@ -884,7 +1252,7 @@ uninstall_program() {
     remove_chain nat PREROUTING "$DNAT_CHAIN"
     remove_chain nat POSTROUTING "$NAT_CHAIN"
 
-    rm -f "$NETWORK_SERVICE" "$NETWORK_TIMER" "$LIMIT_SERVICE" "$AUDIT_SERVICE" "$SESSION_SERVICE"
+    rm -f "$NETWORK_SERVICE" "$NETWORK_TIMER" "$LIMIT_SERVICE" "$AUDIT_SERVICE" "$SESSION_SERVICE" "$AUDIT_MAINT_SERVICE" "$AUDIT_MAINT_TIMER"
     rm -f "$SYSCTL_FILE" "$LOGROTATE_FILE" "$INSTALL_PATH"
     systemctl daemon-reload
     log "程序已卸载。审计日志和配置仍保留在 $LOG_DIR 与 $CONFIG_DIR。"
@@ -977,6 +1345,9 @@ BT 风险控制：
   $PROGRAM bt disable
 
 历史审计：
+  $PROGRAM audit stats
+  $PROGRAM audit maintenance
+  $PROGRAM audit migrate-csv
   $PROGRAM audit lookup --time "2026-08-02 10:30:00 +0800" \\
       --public-port 42671 --protocol tcp \\
       [--destination 198.51.100.20] [--destination-port 51413] [--tolerance 120]
@@ -1000,9 +1371,14 @@ main() {
         session-close) close_active_sessions ;;
         audit)
             shift
-            [[ "${1:-}" == lookup ]] || die "仅支持 audit lookup"
-            shift
-            audit_lookup "$@"
+            case "${1:-}" in
+                lookup) shift; audit_lookup "$@" ;;
+                stats) audit_stats ;;
+                maintenance) audit_maintenance ;;
+                migrate-csv) audit_migrate_csv ;;
+                close-open) audit_close_open ;;
+                *) die "审计命令：lookup/stats/maintenance/migrate-csv" ;;
+            esac
             ;;
         port)
             shift
