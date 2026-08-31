@@ -100,7 +100,7 @@ apt install -y \
 mkdir -p /root/ocserv-manager && \
 wget -N --no-check-certificate \
   -P /root/ocserv-manager \
-  https://raw.githubusercontent.com/jackzhang-superman/limit_manager/main/ocserv-manager.sh && \
+  https://raw.githubusercontent.com/jackzhang-superman/ocserv-manager/main/ocserv-manager.sh && \
 chmod +x /root/ocserv-manager/ocserv-manager.sh && \
 /root/ocserv-manager/ocserv-manager.sh install
 ```
