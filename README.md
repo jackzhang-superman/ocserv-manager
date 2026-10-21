@@ -7,7 +7,8 @@
 - `vpns0、vpns1、vpns2...` 自动限速
 - 宽松 BT/P2P 风险控制
 - 公网端口映射到指定 VPN 用户
-- NAT 历史映射审计（SQLite）
+- **2.2.0：滥用/版权投诉溯源日志（ocserv-attrib + ocserv-whois，默认保留 100 天）**
+- NAT 历史映射审计（SQLite，2.1.0 旧版，已由 ocserv-attrib 取代）
 - VPN 内网 IP 与用户名会话关联
 - 31 天自动清理
 - systemd 开机启动与故障恢复
@@ -195,7 +196,7 @@ ip -4 route show default
 例如：
 
 ```text
-default via 172.238.12.1 dev eth0
+default via 203.0.113.1 dev eth0
 ```
 
 会自动使用：
@@ -373,7 +374,7 @@ iptables -nvL OCSERV_BT_GUARD
 例如：
 
 ```text
-172.238.12.241:33891
+203.0.113.10:33891
         ↓
 192.168.1.129:3389
 ```
@@ -419,6 +420,47 @@ ocserv-manager port delete tcp 33891
 字段：状态、协议、公网端口、VPN IP、目标端口、来源 CIDR、备注。
 
 当前没有映射时，列表只显示表头，没有数据行。这不影响 VPN 用户正常上网（上网使用临时 NAT 源端口）。
+
+---
+
+## 2.2.0 投诉溯源（ocserv-attrib） / Attribution logging
+
+2.2.0 修复了 2.1.0 NAT 审计从未写入记录的问题（`audit_file_today` 未定义），并用独立的 `ocserv-attrib` 取代旧审计：
+2.2.0 fixes the 2.1.0 NAT audit, which never logged anything, and replaces it with `ocserv-attrib`:
+
+| 组件 / Component | 说明 / Description |
+|---|---|
+| `/usr/local/sbin/ocserv-attrib` | `nat-daemon`（conntrack NEW/DESTROY 事件）、`session-daemon`（每 5 秒轮询 occtl）、`maintain`、`stats` |
+| `/usr/local/sbin/ocserv-whois` | 按公网端口/IP/时间查询用户；也可 `ocserv-manager whois ...` |
+| `ocserv-attrib-nat.service` / `ocserv-attrib-session.service` | 常驻服务 |
+| `ocserv-attrib-maint.timer` | 每天 00:20 UTC：gzip 前一天日志，删除超过 `RETENTION_DAYS` 的文件 |
+| `/etc/ocserv-attrib.conf` | `RETENTION_DAYS=100`、`SESSION_INTERVAL=5`、`CT_BUFFER`、`OCCTL_COMMAND` 等 |
+| `/var/log/ocserv-attrib/nat/nat-YYYY-MM-DD.tsv[.gz]` | 列：ts_utc epoch event proto inner_ip inner_port dst_ip dst_port public_ip public_port duration_s |
+| `/var/log/ocserv-attrib/sessions/sess-YYYY-MM-DD.tsv[.gz]` | CONNECT/DISCONNECT/ONLINE、用户名、VPN IP、远端 IP、设备 |
+
+同时设置 `net.netfilter.nf_conntrack_timestamp=1`（`/etc/sysctl.d/98-ocserv-attrib.conf`），用于记录连接时长。
+
+### 查询 / Query
+
+```bash
+ocserv-manager whois --port 3266 --time 2026-10-16T16:58:15Z
+ocserv-whois --port 3266 --ip 203.0.113.10 --time 2026-10-16T16:58:15Z --window 300 \
+    --proto tcp --dst 198.51.100.20 --dport 443 --days-back 3 --json
+ocserv-whois --inner 10.88.1.2 --time 2026-10-16T16:58:15Z   # 仅按 VPN 内网 IP 查用户名
+ocserv-manager attrib stats
+```
+
+时间均为 UTC，日志按 UTC 日切分。若服务器在上游 NAT 之后，查询时不要加 `--ip`，且仅当上游保持端口不变时端口才有效。
+
+### 升级 / Upgrade from 2.1.0
+
+重新下载脚本并执行 `ocserv-manager.sh install`（幂等）。安装会停用旧的 `ocserv-audit.service` 与 `ocserv-audit-maintenance.timer`，启用 attrib 服务；`ocserv-session-audit` 保留，`ocserv-whois` 也会读取其数据作为后备。
+Re-download and run `install` again; legacy audit units are disabled, attrib units enabled. Existing `/etc/ocserv-attrib.conf` is kept.
+
+### 磁盘估算 / Disk estimate
+
+约 67 个在线用户时，gzip 后约 **92 MB/天**，保留 100 天约 9 GB。可调整 `RETENTION_DAYS`。
+About 92 MB/day gzipped at ~67 users (~9 GB for 100 days).
 
 ---
 
@@ -537,7 +579,7 @@ ocserv-manager audit lookup \
   --time "2026-08-02 15:50:00 +0800" \
   --public-port 49758 \
   --protocol tcp \
-  --destination 17.253.71.150 \
+  --destination 198.51.100.20 \
   --destination-port 443
 ```
 
@@ -640,7 +682,10 @@ ocserv-manager
 |---|---|
 | 网络规则 | `ocserv-network.service` / `ocserv-network.timer` |
 | 限速 | `ocserv-limit.service` |
-| NAT 审计 | `ocserv-audit.service` |
+| NAT 审计（2.2.0） | `ocserv-attrib-nat.service` |
+| 会话记录（2.2.0） | `ocserv-attrib-session.service` |
+| 溯源日志维护（2.2.0） | `ocserv-attrib-maint.timer` |
+| 旧 NAT 审计（2.1.0，安装时停用） | `ocserv-audit.service` |
 | 用户名会话 | `ocserv-session-audit.service` |
 | 库维护 | `ocserv-audit-maintenance.timer` |
 

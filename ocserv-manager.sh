@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 PROGRAM="ocserv-manager"
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 INSTALL_PATH="/usr/local/sbin/ocserv-manager"
 CONFIG_DIR="/etc/ocserv-manager"
@@ -766,7 +766,7 @@ session_daemon() {
         current="$(mktemp)"
         tmp="$(mktemp)"
 
-        if output="$(bash -c "$OCCTL_COMMAND" 2>/dev/null)"; then
+        if output="$(timeout 10 bash -c "$OCCTL_COMMAND" 2>/dev/null)"; then
             extract_occtl_sessions "$output" > "$current" || true
 
             declare -A old_user_by_ip=()
@@ -1027,7 +1027,10 @@ EOF
     echo
     systemctl --no-pager --full status \
         ocserv-network.timer ocserv-limit.service \
-        ocserv-audit.service ocserv-session-audit.service ocserv-audit-maintenance.timer 2>/dev/null || true
+        ocserv-audit.service ocserv-session-audit.service ocserv-audit-maintenance.timer \
+        "${ATTRIB_UNITS[@]}" 2>/dev/null || true
+    rm -f /etc/systemd/system/ocserv-attrib-*.service /etc/systemd/system/ocserv-attrib-maint.timer \
+        /usr/local/sbin/ocserv-attrib /usr/local/sbin/ocserv-whois /etc/sysctl.d/98-ocserv-attrib.conf
     echo
     "$IPTABLES_BIN" -nvL "$BT_CHAIN" 2>/dev/null || true
 }
@@ -1192,6 +1195,489 @@ ${SESSION_DIR}/*.csv ${AUDIT_DIR}/*.csv {
 EOF
 }
 
+ATTRIB_UNITS=(ocserv-attrib-nat.service ocserv-attrib-session.service ocserv-attrib-maint.timer)
+
+# 2.2.0: NAT/session attribution logging (ocserv-attrib + ocserv-whois).
+write_attrib_files() {
+    cat > /usr/local/sbin/ocserv-attrib <<'ATTRIB_EOF'
+#!/usr/bin/env python3
+# ocserv-attrib (ocserv-manager 2.2.0 addon): abuse/copyright attribution logging.
+#   nat-daemon      conntrack NEW/DESTROY events of the VPN pool -> /var/log/ocserv-attrib/nat/nat-YYYY-MM-DD.tsv
+#   session-daemon  occtl poller -> /var/log/ocserv-attrib/sessions/sess-YYYY-MM-DD.tsv (CONNECT/DISCONNECT)
+#   maintain        gzip closed days, delete files older than RETENTION_DAYS
+#   stats           sizes / event counts
+# All times UTC. Files are per UTC day.
+import os, sys, re, time, json, subprocess, signal, gzip, shutil, datetime, glob
+
+VERSION = "2.2.0"
+CONF = "/etc/ocserv-attrib.conf"
+
+def load_conf():
+    c = {"VPN_SUBNET": "", "LOG_DIR": "/var/log/ocserv-attrib", "STATE_DIR": "/var/lib/ocserv-attrib",
+         "RETENTION_DAYS": "100", "NAT_EVENTS": "NEW,DESTROY", "IGNORE_DNS_SERVERS": "8.8.8.8,8.8.4.4",
+         "OCCTL_COMMAND": "docker exec ocserv occtl -j show users", "SESSION_INTERVAL": "5",
+         "CT_BUFFER": "67108864"}
+    for f in ("/etc/ocserv-manager/config", CONF):
+        try:
+            for line in open(f):
+                m = re.match(r'^\s*([A-Z_]+)=["\']?(.*?)["\']?\s*$', line)
+                if m and (f == CONF or m.group(1) == "VPN_SUBNET"):
+                    c[m.group(1)] = m.group(2)
+        except FileNotFoundError:
+            pass
+    if not c["VPN_SUBNET"]:
+        c["VPN_SUBNET"] = "10.88.0.0/16"
+    return c
+
+def iso(ts):
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+def day(ts):
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%d")
+
+class DailyWriter:
+    def __init__(self, d, prefix, header):
+        self.d, self.prefix, self.header = d, prefix, header
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        self.cur = None; self.fh = None; self.last_flush = time.time()
+    def write(self, ts, line):
+        dd = day(ts)
+        if dd != self.cur:
+            self.close()
+            path = os.path.join(self.d, f"{self.prefix}-{dd}.tsv")
+            new = not os.path.exists(path) or os.path.getsize(path) == 0
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            self.fh = os.fdopen(fd, "a", buffering=1 << 16)
+            if new:
+                self.fh.write(self.header + "\n")
+            self.cur = dd
+        self.fh.write(line + "\n")
+        now = time.time()
+        if now - self.last_flush >= 2:
+            self.fh.flush(); self.last_flush = now
+    def flush(self):
+        if self.fh: self.fh.flush()
+    def close(self):
+        if self.fh:
+            self.fh.flush(); self.fh.close(); self.fh = None
+
+NAT_HEADER = "#ts_utc\tepoch\tevent\tproto\tinner_ip\tinner_port\tdst_ip\tdst_port\tpublic_ip\tpublic_port\tduration_s"
+TS_RE = re.compile(r'^\[(\d+\.\d+)\]\s+')
+EV_RE = re.compile(r'\[(NEW|DESTROY)\]')
+KV_RE = re.compile(r'\b(src|dst|sport|dport)=(\S+)')
+PROTO_RE = re.compile(r'\b(tcp|udp)\s+\d+\s')
+DUR_RE = re.compile(r'delta-time=(\d+)')
+START_RE = re.compile(r'\[start=([^\]]+)\]')
+
+def parse_ct(line, default_ev=None):
+    m = TS_RE.match(line)
+    ts = float(m.group(1)) if m else time.time()
+    e = EV_RE.search(line)
+    ev = e.group(1) if e else default_ev
+    p = PROTO_RE.search(line)
+    if not ev or not p:
+        return None
+    vals = {"src": [], "dst": [], "sport": [], "dport": []}
+    for k, v in KV_RE.findall(line):
+        vals[k].append(v)
+    if len(vals["src"]) < 2 or len(vals["sport"]) < 2:
+        return None
+    dur = ""
+    d = DUR_RE.search(line)
+    if d:
+        dur = d.group(1)
+    return ts, ev, p.group(1), vals["src"][0], vals["sport"][0], vals["dst"][0], vals["dport"][0], vals["dst"][1], vals["dport"][1], dur
+
+def nat_daemon(c):
+    import ipaddress
+    net = ipaddress.ip_network(c["VPN_SUBNET"], strict=False)
+    ign = set(x.strip() for x in c["IGNORE_DNS_SERVERS"].split(",") if x.strip())
+    w = DailyWriter(os.path.join(c["LOG_DIR"], "nat"), "nat", NAT_HEADER)
+    stop = {"v": False}
+    def term(*a):
+        stop["v"] = True; w.close(); sys.exit(0)
+    signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
+
+    def emit(rec):
+        ts, ev, proto, sip, sp, dip, dp, rsrc, rdport, dur = rec
+        # rsrc = reply src (= original dst); reply dst/dport = public (SNAT) ip/port
+        return
+    def handle(rec):
+        ts, ev, proto, sip, sp, dip, dp, pub_ip, pub_port, dur = rec
+        try:
+            if ipaddress.ip_address(sip) not in net:
+                return
+        except ValueError:
+            return
+        if pub_ip == sip:          # not SNATed (local / DNAT reply etc.)
+            return
+        if dip in ign and dp in ("53", "853"):
+            return
+        w.write(ts, "\t".join((iso(ts), "%.3f" % ts, ev, proto, sip, sp, dip, dp, pub_ip, pub_port, dur)))
+
+    # Snapshot of flows that already exist (start time unknown, <= snapshot time).
+    try:
+        out = subprocess.run(["conntrack", "-L", "-o", "extended", "-s", c["VPN_SUBNET"]],
+                             capture_output=True, text=True, timeout=60).stdout
+        now = time.time(); n = 0
+        for line in out.splitlines():
+            r = parse_ct(line, "SNAP")
+            if r:
+                r = (now,) + r[1:]; handle(r); n += 1
+        w.flush()
+        print(f"snapshot: {n} existing flows", flush=True)
+    except Exception as ex:
+        print(f"snapshot failed: {ex}", file=sys.stderr, flush=True)
+
+    while not stop["v"]:
+        cmd = ["conntrack", "-E", "-e", c["NAT_EVENTS"], "-o", "timestamp,extended",
+               "-s", c["VPN_SUBNET"], "-b", c["CT_BUFFER"]]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1 << 16)
+        for line in p.stdout:
+            r = parse_ct(line)
+            if r:
+                handle(r)
+        w.flush()
+        print(f"conntrack exited rc={p.wait()}, restarting in 3s", file=sys.stderr, flush=True)
+        time.sleep(3)
+
+SESS_HEADER = "#ts_utc\tepoch\tevent\tusername\tvpn_ip\tocctl_id\tremote_ip\tdevice\tconnected_at_raw"
+
+def occtl_users(c):
+    out = subprocess.run(c["OCCTL_COMMAND"], shell=True, capture_output=True, text=True, timeout=15)
+    if out.returncode != 0:
+        raise RuntimeError(f"occtl rc={out.returncode}")
+    data = json.loads(out.stdout or "[]")
+    res = {}
+    for u in data:
+        if u.get("State") != "connected" or not u.get("IPv4"):
+            continue
+        sid = str(u.get("ID"))
+        user = str(u.get("Username", "")).replace("\t", " ").replace("\n", " ")
+        res[sid] = {"user": user, "ip": u.get("IPv4"), "remote": u.get("Remote IP", ""),
+                    "dev": u.get("Device", ""), "cat": u.get("Connected at", "")}
+    return res
+
+def session_daemon(c):
+    sd = c["STATE_DIR"]; os.makedirs(sd, mode=0o700, exist_ok=True)
+    stf = os.path.join(sd, "sessions.json")
+    w = DailyWriter(os.path.join(c["LOG_DIR"], "sessions"), "sess", SESS_HEADER)
+    def line(ts, ev, sid, s):
+        w.write(ts, "\t".join((iso(ts), "%.0f" % ts, ev, s["user"], s["ip"], sid, s["remote"], s["dev"], s["cat"])))
+    state = {}
+    try:
+        st = json.load(open(stf)); state = st.get("sessions", {}); last = st.get("last_poll", time.time())
+    except Exception:
+        last = None
+    def save(ts):
+        tmp = stf + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"last_poll": ts, "sessions": state}, f)
+        os.chmod(tmp, 0o600); os.replace(tmp, stf)
+    def term(*a):
+        w.close(); sys.exit(0)
+    signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
+    first = True
+    interval = float(c["SESSION_INTERVAL"])
+    while True:
+        now = time.time()
+        try:
+            cur = occtl_users(c)
+        except Exception as ex:
+            print(f"occtl failed: {ex}", file=sys.stderr, flush=True)
+            time.sleep(interval); continue
+        for sid in list(state):
+            if sid not in cur or cur[sid]["ip"] != state[sid]["ip"]:
+                # first poll after restart: session ended sometime between last saved poll and now
+                ts = (last if first and last else now)
+                line(ts, "DISCONNECT", sid, state.pop(sid))
+        for sid, s in cur.items():
+            if sid not in state:
+                line(now, "CONNECT" if not first or last is not None else "ONLINE", sid, s)
+                state[sid] = s
+        w.flush(); save(now); last = now; first = False
+        time.sleep(interval)
+
+def maintain(c):
+    keep = int(c["RETENTION_DAYS"])
+    today = day(time.time())
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=keep)).strftime("%Y-%m-%d")
+    for sub in ("nat", "sessions"):
+        for f in sorted(glob.glob(os.path.join(c["LOG_DIR"], sub, "*-????-??-??.tsv*"))):
+            m = re.search(r'(\d{4}-\d{2}-\d{2})\.tsv', f)
+            if not m: continue
+            d = m.group(1)
+            if d < cutoff:
+                os.remove(f); print("deleted", f); continue
+            if f.endswith(".tsv") and d < today:
+                with open(f, "rb") as src, gzip.open(f + ".gz", "wb", 6) as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                os.chmod(f + ".gz", 0o600); os.remove(f); print("compressed", f)
+
+def stats(c):
+    for sub in ("nat", "sessions"):
+        print(f"== {sub}")
+        for f in sorted(glob.glob(os.path.join(c["LOG_DIR"], sub, "*")))[-5:]:
+            print(f"{os.path.getsize(f):>12}  {f}")
+    subprocess.run(["du", "-sh", c["LOG_DIR"]])
+
+if __name__ == "__main__":
+    c = load_conf()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
+    {"nat-daemon": nat_daemon, "session-daemon": session_daemon, "maintain": maintain, "stats": stats}.get(
+        cmd, lambda c: print(f"ocserv-attrib {VERSION}: nat-daemon|session-daemon|maintain|stats"))(c)
+ATTRIB_EOF
+    chmod 755 /usr/local/sbin/ocserv-attrib
+
+    cat > /usr/local/sbin/ocserv-whois <<'ATTRIB_EOF'
+#!/usr/bin/env python3
+"""ocserv-whois (ocserv-manager 2.2.0): public IP:port + time -> NAT flow -> inner VPN IP -> username.
+Usage: ocserv-whois --port 3266 --time 2026-10-16T16:58:15Z [--ip 203.0.113.10] [--window 300]
+                    [--proto tcp|udp] [--dst 198.51.100.20] [--dport 443] [--days-back 3] [--json]
+       ocserv-whois --inner 10.88.1.2 --time ...      (only username lookup for an inner IP)
+Time without zone is treated as UTC. Reads plain and .gz daily files."""
+import argparse, datetime, glob, gzip, json, os, re, sys, time
+
+LOG = "/var/log/ocserv-attrib"
+STATE = "/var/lib/ocserv-attrib/sessions.json"
+OLD_SESS = "/var/log/ocserv-manager/sessions"
+
+def parse_time(s):
+    s = s.strip().replace(" ", "T", 1) if re.match(r"^\d{4}-\d\d-\d\d \d", s) else s.strip()
+    if re.fullmatch(r"\d+(\.\d+)?", s): return float(s)
+    if s.endswith("Z"): s = s[:-1] + "+00:00"
+    d = datetime.datetime.fromisoformat(s)
+    if d.tzinfo is None: d = d.replace(tzinfo=datetime.timezone.utc)
+    return d.timestamp()
+
+def iso(ts):
+    if ts is None: return "?"
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def days(a, b):
+    d = datetime.datetime.fromtimestamp(a, datetime.timezone.utc).date()
+    e = datetime.datetime.fromtimestamp(b, datetime.timezone.utc).date()
+    while d <= e:
+        yield d.isoformat(); d += datetime.timedelta(days=1)
+
+def open_any(f):
+    return gzip.open(f, "rt", errors="replace") if f.endswith(".gz") else open(f, errors="replace")
+
+def files(sub, prefix, a, b):
+    out = []
+    for d in days(a, b):
+        for ext in (".tsv", ".tsv.gz"):
+            f = os.path.join(LOG, sub, f"{prefix}-{d}{ext}")
+            if os.path.exists(f): out.append(f)
+    return out
+
+def nat_flows(a, t0, t1):
+    port = str(a.port)
+    flows, openf = [], {}
+    for f in files("nat", "nat", t0 - a.days_back * 86400, t1 + 86400):
+        with open_any(f) as fh:
+            for ln in fh:
+                if ln.startswith("#") or ("\t" + port + "\t") not in ln:
+                    continue
+                p = ln.rstrip("\n").split("\t")
+                if len(p) < 10 or p[9] != port: continue
+                ts, ev, proto, iip, ipt, dip, dpt, pip, ppt = float(p[1]), p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9]
+                dur = p[10] if len(p) > 10 else ""
+                if a.ip and pip != a.ip: continue
+                if a.proto and proto != a.proto: continue
+                if a.dst and dip != a.dst: continue
+                if a.dport and dpt != str(a.dport): continue
+                k = (proto, iip, ipt, dip, dpt, pip, ppt)
+                if ev in ("NEW", "SNAP"):
+                    fl = {"start": ts if ev == "NEW" else None, "seen": ts, "end": None, "k": k, "src": ev}
+                    flows.append(fl); openf[k] = fl
+                elif ev == "DESTROY":
+                    fl = openf.pop(k, None)
+                    if fl is None:
+                        fl = {"start": ts - float(dur) if dur else None, "seen": ts, "end": None, "k": k, "src": "DESTROY"}
+                        flows.append(fl)
+                    fl["end"] = ts
+                    if fl["start"] is None and dur: fl["start"] = ts - float(dur)
+    res = []
+    now = time.time()
+    for fl in flows:
+        s = fl["start"] if fl["start"] is not None else fl["seen"] - 10 * 86400
+        e = fl["end"] if fl["end"] is not None else now
+        if s <= t1 and e >= t0:
+            fl["diff"] = 0 if s <= a.t <= e else min(abs(s - a.t), abs(e - a.t))
+            res.append(fl)
+    res.sort(key=lambda x: (x["diff"], -(x["start"] or 0)))
+    return res
+
+def sessions_for(ip, t0, t1):
+    """return list of (user, start, end, source) overlapping [t0,t1] for vpn ip"""
+    out, opened = [], {}
+    for f in files("sessions", "sess", t0 - 30 * 86400, t1 + 86400):
+        with open_any(f) as fh:
+            for ln in fh:
+                if ln.startswith("#"): continue
+                p = ln.rstrip("\n").split("\t")
+                if len(p) < 6 or p[4] != ip: continue
+                ts, ev, user, sid = float(p[1]), p[2], p[3], p[5]
+                if ev in ("CONNECT", "ONLINE"):
+                    opened[sid] = [user, ts if ev == "CONNECT" else None, None, "attrib", ts]
+                    out.append(opened[sid])
+                elif ev == "DISCONNECT":
+                    r = opened.pop(sid, None)
+                    if r is None:
+                        r = [user, None, None, "attrib", ts]; out.append(r)
+                    r[2] = ts
+    try:
+        st = json.load(open(STATE))
+        for sid, s in st.get("sessions", {}).items():
+            if s["ip"] == ip and sid in opened:
+                opened[sid][2] = None  # still online
+    except Exception:
+        pass
+    # legacy ocserv-manager 2.1.0 session CSVs (start,end,ip,user; 30s poll)
+    for f in sorted(glob.glob(os.path.join(OLD_SESS, "sessions-*"))):
+        try:
+            with open_any(f) as fh:
+                for ln in fh:
+                    p = ln.strip().split(",", 3)
+                    if len(p) == 4 and p[2] == ip and p[0].isdigit():
+                        out.append([p[3], float(p[0]), float(p[1]), "legacy-2.1", float(p[0])])
+        except Exception:
+            pass
+    now = time.time()
+    res = []
+    for u, s, e, src, seen in out:
+        s2 = s if s is not None else seen - 30 * 86400
+        e2 = e if e is not None else now
+        if s2 <= t1 and e2 >= t0:
+            res.append({"user": u, "start": s, "end": e, "source": src, "first_seen": seen})
+    return res
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", type=int); ap.add_argument("--ip"); ap.add_argument("--time", required=True)
+    ap.add_argument("--window", type=int, default=300); ap.add_argument("--proto", choices=["tcp", "udp"])
+    ap.add_argument("--dst"); ap.add_argument("--dport", type=int); ap.add_argument("--days-back", type=int, default=3)
+    ap.add_argument("--inner"); ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    a.t = parse_time(a.time); t0, t1 = a.t - a.window, a.t + a.window
+    result = {"query": {"time": iso(a.t), "window_s": a.window, "public_ip": a.ip, "public_port": a.port}, "flows": []}
+    if a.inner:
+        result["flows"].append({"inner_ip": a.inner, "users": sessions_for(a.inner, a.t, a.t)})
+    else:
+        if not a.port: ap.error("--port or --inner required")
+        for fl in nat_flows(a, t0, t1)[:50]:
+            proto, iip, ipt, dip, dpt, pip, ppt = fl["k"]
+            s = fl["start"] if fl["start"] is not None else fl["seen"]
+            e = fl["end"] if fl["end"] is not None else time.time()
+            at = min(max(a.t, s), e)          # point of the flow closest to the query time
+            users = sessions_for(iip, at, at)
+            result["flows"].append({"proto": proto, "public": f"{pip}:{ppt}", "inner_ip": iip, "inner_port": ipt,
+                                    "dst": f"{dip}:{dpt}", "start": iso(fl["start"]) if fl["start"] else f"<= {iso(fl['seen'])} (pre-existing)",
+                                    "end": iso(fl["end"]) if fl["end"] else "open/unknown", "diff_s": round(fl["diff"]), "users": users})
+    if a.json:
+        print(json.dumps(result, indent=1, default=str)); return
+    q = result["query"]
+    print(f"query: time={q['time']} ±{a.window}s public={a.ip or '*'}:{a.port or '-'}")
+    if not result["flows"]:
+        print("NO MATCH: no NAT flow in window (try --window larger / --days-back / drop --ip)"); sys.exit(1)
+    for f in result["flows"]:
+        if "proto" in f:
+            print(f"\nFLOW {f['proto']} public {f['public']}  inner {f['inner_ip']}:{f['inner_port']} -> {f['dst']}"
+                  f"  start {f['start']}  end {f['end']}  Δ={f['diff_s']}s")
+        else:
+            print(f"\nINNER {f['inner_ip']}")
+        if not f["users"]:
+            print("   USER: (no session record covering this time)")
+        for u in f["users"]:
+            print(f"   USER: {u['user'].strip()!s:40}  session {iso(u['start']) if u['start'] else '<='+iso(u['first_seen'])} .. "
+                  f"{iso(u['end']) if u['end'] else 'online'}  [{u['source']}]")
+
+if __name__ == "__main__":
+    main()
+ATTRIB_EOF
+    chmod 755 /usr/local/sbin/ocserv-whois
+
+    if [[ ! -f /etc/ocserv-attrib.conf ]]; then
+        cat > /etc/ocserv-attrib.conf <<'ATTRIB_EOF'
+# ocserv-attrib (ocserv-manager 2.2.0). VPN_SUBNET defaults to /etc/ocserv-manager/config.
+#VPN_SUBNET="10.88.0.0/16"
+LOG_DIR="/var/log/ocserv-attrib"
+STATE_DIR="/var/lib/ocserv-attrib"
+RETENTION_DAYS="100"
+NAT_EVENTS="NEW,DESTROY"
+IGNORE_DNS_SERVERS="8.8.8.8,8.8.4.4"
+OCCTL_COMMAND="docker exec ocserv occtl -j show users"
+SESSION_INTERVAL="5"
+CT_BUFFER="67108864"
+ATTRIB_EOF
+        chmod 600 /etc/ocserv-attrib.conf
+    fi
+
+    mkdir -p /var/log/ocserv-attrib/nat /var/log/ocserv-attrib/sessions /var/lib/ocserv-attrib
+    chmod 700 /var/log/ocserv-attrib /var/log/ocserv-attrib/nat /var/log/ocserv-attrib/sessions /var/lib/ocserv-attrib
+
+    echo 'net.netfilter.nf_conntrack_timestamp = 1' > /etc/sysctl.d/98-ocserv-attrib.conf
+    sysctl -q -w net.netfilter.nf_conntrack_timestamp=1 2>/dev/null || true
+
+    cat > /etc/systemd/system/ocserv-attrib-nat.service <<'ATTRIB_EOF'
+[Unit]
+Description=ocserv-attrib: log VPN-pool NAT mappings (conntrack NEW/DESTROY events)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe nf_conntrack
+ExecStartPre=-/sbin/sysctl -q -w net.netfilter.nf_conntrack_timestamp=1
+ExecStart=/usr/local/sbin/ocserv-attrib nat-daemon
+Restart=always
+RestartSec=3
+Nice=5
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target
+ATTRIB_EOF
+    cat > /etc/systemd/system/ocserv-attrib-session.service <<'ATTRIB_EOF'
+[Unit]
+Description=ocserv-attrib: log username <-> VPN IP sessions (occtl poll 5s)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ocserv-attrib session-daemon
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+ATTRIB_EOF
+    cat > /etc/systemd/system/ocserv-attrib-maint.service <<'ATTRIB_EOF'
+[Unit]
+Description=ocserv-attrib: gzip closed days, prune > RETENTION_DAYS
+
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/ocserv-attrib maintain
+ATTRIB_EOF
+    cat > /etc/systemd/system/ocserv-attrib-maint.timer <<'ATTRIB_EOF'
+[Unit]
+Description=ocserv-attrib daily maintenance
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+ATTRIB_EOF
+}
+
 install_program() {
     require_root
 
@@ -1217,9 +1703,14 @@ EOF
     systemctl daemon-reload
     systemctl enable --now ocserv-network.timer
     systemctl enable --now ocserv-limit.service
-    systemctl enable --now ocserv-audit.service
     systemctl enable --now ocserv-session-audit.service
-    systemctl enable --now ocserv-audit-maintenance.timer
+    # 2.2.0: legacy NAT audit (never logged in 2.1.0) replaced by ocserv-attrib
+    systemctl disable --now ocserv-audit.service ocserv-audit-maintenance.timer 2>/dev/null || true
+    systemctl reset-failed ocserv-audit-maintenance.service 2>/dev/null || true
+    write_attrib_files
+    systemctl daemon-reload
+    systemctl enable --now "${ATTRIB_UNITS[@]}"
+    systemctl restart ocserv-attrib-nat.service ocserv-attrib-session.service
     systemctl restart ocserv-network.service
 
     log "安装完成。"
@@ -1255,7 +1746,7 @@ uninstall_program() {
     rm -f "$NETWORK_SERVICE" "$NETWORK_TIMER" "$LIMIT_SERVICE" "$AUDIT_SERVICE" "$SESSION_SERVICE" "$AUDIT_MAINT_SERVICE" "$AUDIT_MAINT_TIMER"
     rm -f "$SYSCTL_FILE" "$LOGROTATE_FILE" "$INSTALL_PATH"
     systemctl daemon-reload
-    log "程序已卸载。审计日志和配置仍保留在 $LOG_DIR 与 $CONFIG_DIR。"
+    log "程序已卸载。审计日志和配置仍保留在 $LOG_DIR、$CONFIG_DIR、/var/log/ocserv-attrib 与 /etc/ocserv-attrib.conf。"
 }
 
 menu() {
@@ -1301,17 +1792,17 @@ EOF
             7) bt_toggle yes ;;
             8) bt_toggle no ;;
             9)
-                read -r -p "事件时间（含时区）：" t
+                read -r -p "事件时间（UTC 例如 2026-10-16T16:58:15Z）：" t
                 read -r -p "公网源端口：" pp
-                read -r -p "协议 tcp/udp：" p
+                read -r -p "协议 tcp/udp（可留空）：" p
                 read -r -p "目标 IP（可留空）：" d
                 read -r -p "目标端口（可留空）：" dp
-                audit_lookup --time "$t" --public-port "$pp" --protocol "$p" \
-                    ${d:+--destination "$d"} ${dp:+--destination-port "$dp"}
+                /usr/local/sbin/ocserv-whois --port "$pp" --time "$t" \
+                    ${p:+--proto "$p"} ${d:+--dst "$d"} ${dp:+--dport "$dp"}
                 ;;
             10) "${EDITOR:-nano}" "$CONFIG_FILE" ;;
             11) journalctl -u ocserv-network.service -u ocserv-limit.service \
-                    -u ocserv-audit.service -u ocserv-session-audit.service -n 100 --no-pager ;;
+                    -u ocserv-attrib-nat.service -u ocserv-attrib-session.service -u ocserv-session-audit.service -n 100 --no-pager ;;
             12)
                 read -r -p "输入 YES 确认卸载：" x
                 [[ "$x" == YES ]] && uninstall_program && exit
@@ -1344,7 +1835,13 @@ BT 风险控制：
   $PROGRAM bt enable
   $PROGRAM bt disable
 
-历史审计：
+滥用/版权投诉溯源（2.2.0，ocserv-attrib）：
+  $PROGRAM whois --port 3266 --time 2026-10-16T16:58:15Z [--ip 203.0.113.10] [--window 300] \\
+      [--proto tcp|udp] [--dst 198.51.100.20] [--dport 443] [--days-back 3] [--json]
+  $PROGRAM whois --inner 10.88.1.2 --time 2026-10-16T16:58:15Z
+  $PROGRAM attrib stats|maintain
+
+旧版历史审计（2.1.0，已由 ocserv-attrib 取代）：
   $PROGRAM audit stats
   $PROGRAM audit maintenance
   $PROGRAM audit migrate-csv
@@ -1366,7 +1863,9 @@ main() {
         limit-apply) limit_apply ;;
         limit-daemon) limit_daemon ;;
         limit-clear) limit_clear ;;
-        audit-daemon) audit_daemon ;;
+        whois) shift; exec /usr/local/sbin/ocserv-whois "$@" ;;
+        attrib) shift; exec /usr/local/sbin/ocserv-attrib "$@" ;;
+        audit-daemon) log "2.2.0: NAT audit moved to ocserv-attrib-nat.service"; exec sleep infinity ;;
         session-daemon) session_daemon ;;
         session-close) close_active_sessions ;;
         audit)
@@ -1374,7 +1873,7 @@ main() {
             case "${1:-}" in
                 lookup) shift; audit_lookup "$@" ;;
                 stats) audit_stats ;;
-                maintenance) audit_maintenance ;;
+                maintenance) exec /usr/local/sbin/ocserv-attrib maintain ;;
                 migrate-csv) audit_migrate_csv ;;
                 close-open) audit_close_open ;;
                 *) die "审计命令：lookup/stats/maintenance/migrate-csv" ;;
