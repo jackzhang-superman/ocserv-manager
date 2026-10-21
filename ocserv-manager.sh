@@ -262,6 +262,112 @@ network_apply() {
     log "网络、BT 风险控制和端口映射规则已应用。公网网卡：$wan"
 }
 
+
+network_inputs_fingerprint() {
+    local wan="$1" public_ip="$2"
+    {
+        printf 'VPN_SUBNET=%s\n' "${VPN_SUBNET}"
+        printf 'VPN_INTERFACE_GLOB=%s\n' "${VPN_INTERFACE_GLOB}"
+        printf 'WAN_INTERFACE=%s\n' "${WAN_INTERFACE}"
+        printf 'RESOLVED_WAN=%s\n' "${wan}"
+        printf 'PUBLIC_IPV4=%s\n' "${public_ip:-}"
+        printf 'BT_GUARD_ENABLED=%s\n' "${BT_GUARD_ENABLED}"
+        printf 'BT_CONN_LIMIT=%s\n' "${BT_CONN_LIMIT}"
+        printf 'BT_NEW_RATE=%s\n' "${BT_NEW_RATE}"
+        printf 'BT_NEW_BURST=%s\n' "${BT_NEW_BURST}"
+        printf 'BT_BLOCK_CLASSIC_PORTS=%s\n' "${BT_BLOCK_CLASSIC_PORTS}"
+        printf 'BT_STRING_MATCH=%s\n' "${BT_STRING_MATCH}"
+        printf '%s\n' '---PORT_MAP---'
+        if [[ -r "$PORT_MAP_FILE" ]]; then
+            # stable content hash (ignore blank trailing noise)
+            sed '/^[[:space:]]*$/d' "$PORT_MAP_FILE"
+        fi
+    } | sha256sum | awk '{print $1}'
+}
+
+network_state_fingerprint() {
+    local ipt="$IPTABLES_BIN"
+    {
+        printf '=== filter %s ===\n' "$FORWARD_CHAIN"
+        "$ipt" -w -S "$FORWARD_CHAIN" 2>/dev/null || printf 'MISSING\n'
+        printf '=== filter %s ===\n' "$BT_CHAIN"
+        "$ipt" -w -S "$BT_CHAIN" 2>/dev/null || printf 'MISSING\n'
+        printf '=== filter %s ===\n' "$DNAT_FILTER_CHAIN"
+        "$ipt" -w -S "$DNAT_FILTER_CHAIN" 2>/dev/null || printf 'MISSING\n'
+        printf '=== nat %s ===\n' "$NAT_CHAIN"
+        "$ipt" -w -t nat -S "$NAT_CHAIN" 2>/dev/null || printf 'MISSING\n'
+        printf '=== nat %s ===\n' "$DNAT_CHAIN"
+        "$ipt" -w -t nat -S "$DNAT_CHAIN" 2>/dev/null || printf 'MISSING\n'
+        if "$ipt" -w -C FORWARD -j "$FORWARD_CHAIN" 2>/dev/null; then
+            printf 'JUMP filter FORWARD -> %s\n' "$FORWARD_CHAIN"
+        else
+            printf 'NOJUMP filter FORWARD -> %s\n' "$FORWARD_CHAIN"
+        fi
+        if "$ipt" -w -t nat -C PREROUTING -j "$DNAT_CHAIN" 2>/dev/null; then
+            printf 'JUMP nat PREROUTING -> %s\n' "$DNAT_CHAIN"
+        else
+            printf 'NOJUMP nat PREROUTING -> %s\n' "$DNAT_CHAIN"
+        fi
+        if "$ipt" -w -t nat -C POSTROUTING -j "$NAT_CHAIN" 2>/dev/null; then
+            printf 'JUMP nat POSTROUTING -> %s\n' "$NAT_CHAIN"
+        else
+            printf 'NOJUMP nat POSTROUTING -> %s\n' "$NAT_CHAIN"
+        fi
+    } | sha256sum | awk '{print $1}'
+}
+
+network_jumps_healthy() {
+    local ipt="$IPTABLES_BIN"
+    "$ipt" -w -n -L "$FORWARD_CHAIN" >/dev/null 2>&1 || return 1
+    "$ipt" -w -n -L "$BT_CHAIN" >/dev/null 2>&1 || return 1
+    "$ipt" -w -n -L "$DNAT_FILTER_CHAIN" >/dev/null 2>&1 || return 1
+    "$ipt" -w -t nat -n -L "$NAT_CHAIN" >/dev/null 2>&1 || return 1
+    "$ipt" -w -t nat -n -L "$DNAT_CHAIN" >/dev/null 2>&1 || return 1
+    "$ipt" -w -C FORWARD -j "$FORWARD_CHAIN" 2>/dev/null || return 1
+    "$ipt" -w -t nat -C PREROUTING -j "$DNAT_CHAIN" 2>/dev/null || return 1
+    "$ipt" -w -t nat -C POSTROUTING -j "$NAT_CHAIN" 2>/dev/null || return 1
+    return 0
+}
+
+network_ensure() {
+    require_root
+    load_config
+    ensure_dirs
+
+    local ipt="$IPTABLES_BIN" wan public_ip
+    [[ -x "$ipt" ]] || die "iptables 不可执行：$ipt"
+    wan="$(resolve_wan)"
+    public_ip="$(detect_public_ipv4 "$wan")"
+
+    local inputs_hash state_hash
+    inputs_hash="$(network_inputs_fingerprint "$wan" "$public_ip")"
+    state_hash="$(network_state_fingerprint)"
+
+    local last_inputs_file="${STATE_DIR}/network-inputs.sha256"
+    local last_state_file="${STATE_DIR}/network-state.sha256"
+    local last_inputs="" last_state=""
+    [[ -r "$last_inputs_file" ]] && last_inputs="$(tr -d '\r\n' < "$last_inputs_file")"
+    [[ -r "$last_state_file" ]] && last_state="$(tr -d '\r\n' < "$last_state_file")"
+
+    if [[ "$inputs_hash" == "$last_inputs" && "$state_hash" == "$last_state" ]] && network_jumps_healthy; then
+        logger -t "$PROGRAM" "network unchanged skip wan=$wan"
+        log "网络规则未变化，跳过重刷。"
+        return 0
+    fi
+
+    network_apply
+
+    # Re-resolve in case apply/logging path changed nothing material; refresh fingerprints.
+    wan="$(resolve_wan)"
+    public_ip="$(detect_public_ipv4 "$wan")"
+    inputs_hash="$(network_inputs_fingerprint "$wan" "$public_ip")"
+    state_hash="$(network_state_fingerprint)"
+    printf '%s\n' "$inputs_hash" > "$last_inputs_file"
+    printf '%s\n' "$state_hash" > "$last_state_file"
+    chmod 600 "$last_inputs_file" "$last_state_file"
+    logger -t "$PROGRAM" "network ensure applied wan=$wan"
+}
+
 ensure_ifb() {
     modprobe ifb numifbs=1 2>/dev/null || modprobe ifb 2>/dev/null || true
     if ! ip link show "$IFB_DEVICE" >/dev/null 2>&1; then
@@ -1084,7 +1190,7 @@ After=network-online.target docker.service
 
 [Service]
 Type=oneshot
-ExecStart=${INSTALL_PATH} network-apply
+ExecStart=${INSTALL_PATH} network-ensure
 EOF
 
     cat > "$NETWORK_TIMER" <<EOF
@@ -1821,6 +1927,7 @@ $PROGRAM $VERSION
   $PROGRAM uninstall
   $PROGRAM status
   $PROGRAM menu
+  $PROGRAM network-ensure
   $PROGRAM network-apply
   $PROGRAM set-rate 50mbit
   $PROGRAM limit-apply
@@ -1858,6 +1965,7 @@ main() {
         uninstall) uninstall_program ;;
         status) status ;;
         menu) menu ;;
+        network-ensure) network_ensure ;;
         network-apply) network_apply ;;
         set-rate) shift; set_rate "${1:-}" ;;
         limit-apply) limit_apply ;;
